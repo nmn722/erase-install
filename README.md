@@ -1,5 +1,8 @@
 # erase-install
 
+Basic usage
+`curl -s https://raw.githubusercontent.com/nmn722/erase-install/release/erase-install.sh | sudo zsh /dev/stdin <arguments>`
+
 by Graham Pugh
 
 ![](https://img.shields.io/github/v/release/grahampugh/erase-install)&nbsp;![](https://img.shields.io/github/downloads/grahampugh/erase-install/latest/total)&nbsp;![](https://img.shields.io/github/downloads/grahampugh/erase-install/total)&nbsp;![](https://img.shields.io/badge/macOS-11%2B-success)&nbsp;![](https://img.shields.io/github/license/grahampugh/erase-install)
