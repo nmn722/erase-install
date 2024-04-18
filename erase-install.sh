@@ -24,10 +24,7 @@ It will also download mist if it is not found.
 Suppress the downloads with the --no-curl option.
 
 Requirements:
-- macOS 12.4+
-- macOS 10.13.4+ (for --erase option)
-- macOS 10.15+ (for --fetch-full-installer option, and for mist)
-- macOS 11+ (for dialogs)
+- macOS 11+ (for use on older versions of macOS, download version 27.3 of erase-install.sh)
 - Device file system is APFS
 DOC
 
@@ -40,7 +37,7 @@ script_name="erase-install"
 pkg_label="com.github.grahampugh.erase-install"
 
 # Version of this script
-version="31.0"
+version="33.1"
 
 # Directory in which to place the macOS installer. Overridden with --path
 installer_directory="/Applications"
@@ -61,15 +58,13 @@ mist_download_url="https://github.com/ninxsoft/mist-cli/releases/download/v${mis
 
 # URL for downloading swiftDialog (with tag version)
 # This ensures a compatible swiftDialog version is used if not using the package installer
-swiftdialog_version_required="2.3.2-4726"
-swiftdialog_tag_required=$(cut -d"-" -f1 <<< "$swiftdialog_version_required")
-dialog_download_url="https://github.com/bartreardon/swiftDialog/releases/download/v${swiftdialog_tag_required}/dialog-${swiftdialog_version_required}.pkg"
+swiftdialog_version_required="2.4.2-4755"
+dialog_download_url="https://github.com/swiftDialog/swiftDialog/releases/download/v${swiftdialog_version_required/-*/}/dialog-${swiftdialog_version_required}.pkg"
 
 # URL for downloading swiftDialog on macOS 11 (with tag version)
 # This ensures a compatible swiftDialog version is used if not using the package installer
 swiftdialog_bigsur_version_required="2.2.1-4591"
-swiftdialog_bigsur_tag_required=$(cut -d"-" -f1 <<< "$swiftdialog_bigsur_version_required")
-dialog_bigsur_download_url="https://github.com/bartreardon/swiftDialog/releases/download/v${swiftdialog_bigsur_tag_required}/dialog-${swiftdialog_bigsur_version_required}.pkg"
+dialog_bigsur_download_url="https://github.com/swiftDialog/swiftDialog/releases/download/v${swiftdialog_bigsur_version_required/-*/}/dialog-${swiftdialog_bigsur_version_required}.pkg"
 
 # swiftDialog variables
 dialog_app="/Library/Application Support/Dialog/Dialog.app"
@@ -82,6 +77,7 @@ dialog_dl_icon="/System/Library/PrivateFrameworks/SoftwareUpdate.framework/Versi
 dialog_confirmation_icon="/System/Applications/System Settings.app"
 dialog_warning_icon="SF=xmark.circle,colour=red"
 dialog_fmm_icon="/System/Library/PrivateFrameworks/AOSUI.framework/Versions/A/Resources/findmy.icns"
+dialog_icon_size="128"
 
 # default app and package names for mist
 default_downloaded_app_name="Install %NAME%.app"
@@ -107,9 +103,9 @@ ask_for_credentials() {
         "--icon"
         "${dialog_confirmation_icon}"
         "--overlayicon"
-        "SF=person.badge.key.fill,colour=grey"
+        "SF=key.fill,colour=grey"
         "--iconsize"
-        "128"
+        "${dialog_icon_size}"
         "--textfield"
         "Username,prompt=$current_user"
         "--textfield"
@@ -167,7 +163,7 @@ check_fmm() {
             "--overlayicon"
             "${dialog_fmm_icon}"
             "--iconsize"
-            "128"
+            "${dialog_icon_size}"
             "--message"
             "${(P)dialog_fmm_desc}"
             "--timer"
@@ -202,9 +198,9 @@ check_fmm() {
             "--icon"
             "${dialog_confirmation_icon}"
             "--iconsize"
-            "128"
+            "${dialog_icon_size}"
             "--overlayicon"
-            "SF=laptopcomputer.trianglebadge.exclamationmark,colour=red"
+            "${dialog_fmm_icon}"
             "--message"
             "${(P)dialog_fmmenabled_desc}"
         )
@@ -215,6 +211,35 @@ check_fmm() {
         echo
         exit 1
     fi
+}
+
+# -----------------------------------------------------------------------------
+# Checks for active meetings.
+# Function taken from installomator, function hasDisplaySleepAssertion
+# Called when --check-activty option is used.
+# -----------------------------------------------------------------------------
+check_for_presentation_activity() {
+    # Get the names of all apps with active display sleep assertions
+    local apps
+    apps="$(/usr/bin/pmset -g assertions | /usr/bin/awk '/NoDisplaySleepAssertion | PreventUserIdleDisplaySleep/ && match($0,/\(.+\)/) && ! /coreaudiod/ {gsub(/^.*\(/,"",$0); gsub(/\).*$/,"",$0); print};')"
+
+    if [[ ! "$apps" ]]; then
+        # No display sleep assertions detected
+        writelog "[check_for_presentation_activity] No active meetings detected. Continuing."
+        return
+    fi
+
+    # Create an array of apps that need to be ignored
+    IGNORE_DND_APPS="caffeinate"
+    local ignore_array=("${(@s/,/)IGNORE_DND_APPS}")
+
+    for app in ${(f)apps}; do
+        if (( ! ${ignore_array[(Ie)${app}]} )); then
+            # Relevant app with display sleep assertion detected
+            writelog "[check_for_presentation_activity] Active meeting detected (${app}). Exiting."
+            exit 0
+        fi
+    done    
 }
 
 # -----------------------------------------------------------------------------
@@ -248,29 +273,31 @@ check_for_mist() {
 # -----------------------------------------------------------------------------
 check_for_swiftdialog_app() {
     # swiftDialog 2.3 and higher are incompatible with macOS 11. Remove this version if present.
-    if [[ $(echo "$system_version_major < 12" | bc) -eq 1 && -d "$dialog_app" && -f "$dialog_bin" ]]; then
-        dialog_string=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" /Library/Application\ Support/Dialog/Dialog.app/Contents/Info.plist)
-        dialog_minor_vers=$(cut -d. -f1,2 <<< "$dialog_string")
-        if [[ $(echo "$dialog_minor_vers > 2.2" | bc) -eq 1 ]]; then
-            writelog "[check_for_swiftdialog_app] swiftDialog v$dialog_string is installed but is not compatible with macOS $system_version_major. Removing v$dialog_string..."
-            app_directory="/Library/Application Support/Dialog"
-            bin_shortcut="/usr/local/bin/dialog"
-            /bin/rm -rf "$app_directory" 
-            /bin/rm -f "$bin_shortcut" /var/tmp/dialog.*
+    if [[ -d "$dialog_app" && -f "$dialog_bin" ]]; then
+        if ! is-at-least "12" "$system_version"; then 
+            dialog_string=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" /Library/Application\ Support/Dialog/Dialog.app/Contents/Info.plist)
+            dialog_minor_vers=$(cut -d. -f1,2 <<< "$dialog_string")
+            if [[ $(echo "$dialog_minor_vers > 2.2" | bc) -eq 1 ]]; then
+                writelog "[check_for_swiftdialog_app] swiftDialog v$dialog_string is installed but is not compatible with macOS $system_version. Removing v$dialog_string..."
+                app_directory="/Library/Application Support/Dialog"
+                bin_shortcut="/usr/local/bin/dialog"
+                /bin/rm -rf "$app_directory" 
+                /bin/rm -f "$bin_shortcut" /var/tmp/dialog.*
+            fi
         fi
     fi
 
     # now check for any version of swiftDialog and download if not present
     if [[ -d "$dialog_app" && -f "$dialog_bin" ]]; then
-        dialog_string=$("$dialog_bin" --version)
+        dialog_string=$("$dialog_bin" --version 2>/dev/null)
         dialog_minor_vers=$(cut -d. -f1,2 <<< "$dialog_string")
         writelog "[check_for_swiftdialog_app] swiftDialog v$dialog_string is installed ($dialog_app)"
     else
         if [[ ! $no_curl ]]; then
-            if [[ $(echo "$system_version_major < 12" | bc) -eq 1 ]]; then
+            if ! is-at-least "12" "$system_version"; then 
                 # we need to get the older version of swiftDialog that is compatible with Big Sur
                 dialog_download_url="$dialog_bigsur_download_url"
-                writelog "[check_for_swiftdialog_app] Downloading swiftDialog for macOS $system_version_major..."
+                writelog "[check_for_swiftdialog_app] Downloading swiftDialog for macOS $system_version..."
             else
                 writelog "[check_for_swiftdialog_app] Downloading swiftDialog..."
             fi
@@ -315,7 +342,7 @@ check_free_space() {
     free_disk_space=$(osascript -l 'JavaScript' -e "ObjC.import('Foundation'); var freeSpaceBytesRef=Ref(); $.NSURL.fileURLWithPath('/').getResourceValueForKeyError(freeSpaceBytesRef, 'NSURLVolumeAvailableCapacityForImportantUsageKey', null); Math.round(ObjC.unwrap(freeSpaceBytesRef[0]) / 1000000000)")
 
     if [[ ! "$free_disk_space" ]] || [[ "$free_disk_space" == 0 ]]; then
-        # fall back to df -h if the above fails
+        # fall back to df if the above fails
         free_disk_space=$(df -Pk . | column -t | sed 1d | awk '{print $4}' | xargs -I{} expr {} / 1000000)
     fi
 
@@ -337,9 +364,9 @@ check_free_space() {
             "--icon"
             "${dialog_confirmation_icon}"
             "--iconsize"
-            "128"
+            "${dialog_icon_size}"
             "--overlayicon"
-            "SF=externaldrive.fill.badge.exclamationmark,colour=red"
+            "SF=externaldrive.fill.badge.xmark,colour=red"
             "--message"
             "${(P)dialog_check_desc}"
             "--button1text"
@@ -378,11 +405,25 @@ check_installer_is_valid() {
             if [[ -f "$build_xml" ]]; then
                 writelog "[check_installer_is_valid] Using Build value from com_apple_MobileAsset_MacSoftwareUpdate.xml"
                 installer_build=$(/usr/libexec/PlistBuddy -c "Print :Assets:0:Build" "$build_xml")
-                sleep 1
-                diskutil unmount force "/Volumes/Shared Support"
+
+                # Also get the compatible device/board IDs of the installer and compare with the system device/board ID
+                # 1. Grab device/board ID
+                get_device_id
+                # 2. Grab compatible device/board IDs from com_apple_MobileAsset_MacSoftwareUpdate
+                compatible_device_ids=$(grep -A2 "SupportedDeviceModels" "$build_xml" | grep string | awk -F '<string>|</string>' '{ print $2 }')
+                # 3. Check that 1 is in 2. 
+                if [[ ($device_id && "$compatible_device_ids" == *"$device_id"*) || ($board_id && "$compatible_device_ids" == *"$board_id") ]]; then
+                    writelog "[check_installer_is_valid] Installer is compatible with system"
+                else
+                    writelog "[check_installer_is_valid] ERROR: Installer is incompatible with system"
+                    invalid_installer_found="yes"
+                fi
             else
                 writelog "[check_installer_is_valid] ERROR: com_apple_MobileAsset_MacSoftwareUpdate.xml not found. Check the mount point at /Volumes/Shared Support"
             fi
+            # now we can unmount the dmg
+            sleep 1
+            diskutil unmount force "/Volumes/Shared Support"
         else
             writelog "[check_installer_is_valid] Mounting SharedSupport.dmg failed"
         fi
@@ -399,14 +440,9 @@ check_installer_is_valid() {
     # bail out if we did not obtain a build number
     if [[ $installer_build ]]; then
         # compare the local system's build number with that of the installer app 
-        compare_build_versions "$system_build" "$installer_build"
-        if [[ $first_build_major_newer == "yes" || $first_build_minor_newer == "yes" ]]; then
+        if ! is-at-least "$system_build" "$installer_build"; then
             writelog "[check_installer_is_valid] Installer: $installer_build < System: $system_build : invalid build."
             invalid_installer_found="yes"
-        elif [[ $first_build_patch_newer == "yes" ]]; then
-            writelog "[check_installer_is_valid] Installer: $installer_build < System: $system_build : build might work but if it fails, please obtain a newer installer."
-            warning_issued="yes"
-            invalid_installer_found="no"
         else
             writelog "[check_installer_is_valid] Installer: $installer_build >= System: $system_build : valid build."
             invalid_installer_found="no"
@@ -432,9 +468,7 @@ check_installer_pkg_is_valid() {
     installer_pkg_build=$( basename "$cached_installer_pkg" | sed 's|.pkg||' | cut -d'-' -f3 )
 
     # compare the local system's build number with that of InstallAssistant.pkg 
-    compare_build_versions "$system_build" "$installer_pkg_build"
-
-    if [[ $first_build_newer == "yes" ]]; then
+    if is-at-least ! "$system_build" "$installer_pkg_build"; then
         writelog "[check_installer_pkg_is_valid] Installer: $installer_pkg_build < System: $system_build : invalid build."
         working_installer_pkg="$cached_installer_pkg"
         invalid_installer_found="yes"
@@ -451,10 +485,9 @@ check_installer_pkg_is_valid() {
 # This requires mist, so we first check if this is on the system and download 
 # if not.
 # We are using mist to list all available installers, with
-# options for different catalogs and seeds, and whether to include betas or 
+# options for different catalogs, and whether to include betas or 
 # not.
 # -----------------------------------------------------------------------------
-
 check_newer_available() {
     # Download mist if not present
     check_for_mist
@@ -477,11 +510,6 @@ check_newer_available() {
         # to avoid a bug where mist-cli does a glob search for the major version, convert it to the name (this is resolved in mist-cli 2.0 but will leave here for now to avoid problems with older installations)
         prechosen_os_name=$(convert_os_to_name "$prechosen_os")
         writelog "[check_newer_available] Restricting to selected OS '$prechosen_os'"
-        mist_args+=("$prechosen_os_name")
-    elif [[ $sameos ]]; then
-        # to avoid a bug where mist-cli does a glob search for the major version, convert it to the name (this is resolved in mist-cli 2.0 but will leave here for now to avoid problems with older installations)
-        prechosen_os_name=$(convert_os_to_name "$system_version_major")
-        writelog "[run_mist] Restricting to selected OS '$system_version_major'"
         mist_args+=("$prechosen_os_name")
     fi
 
@@ -520,12 +548,10 @@ check_newer_available() {
             if [[ "$available_build" ]]; then
                 if [[ $installer_pkg_build ]]; then
                     echo "Comparing latest build found ($available_build) with cached pkg installer build ($installer_pkg_build)"
-                    compare_build_versions "$available_build" "$installer_pkg_build"
                 else
                     echo "Comparing latest build found ($available_build) with cached installer build ($installer_build)"
-                    compare_build_versions "$available_build" "$installer_build"
                 fi
-                if [[ "$first_build_newer" == "yes" ]]; then
+                if ! is-at-least "$available_build" "$installer_build"; then
                     newer_build_found="yes"
                 fi
             fi
@@ -591,9 +617,9 @@ check_power_status() {
             "--icon"
             "${dialog_confirmation_icon}"
             "--overlayicon"
-            "SF=powerplug.fill,colour=red"
+            "SF=bolt.slash.fill,colour=red"
             "--iconsize"
-            "128"
+            "${dialog_icon_size}"
             "--message"
             "${(P)dialog_power_desc}"
             "--timer"
@@ -628,7 +654,7 @@ check_power_status() {
             "--icon"
             "${dialog_confirmation_icon}"
             "--iconsize"
-            "128"
+            "${dialog_icon_size}"
             "--overlayicon"
             "SF=powerplug.fill,colour=red"
             "--message"
@@ -641,94 +667,6 @@ check_power_status() {
         echo
         exit 1
     fi
-}
-
-# -----------------------------------------------------------------------------
-# Compare build numbers.
-# This compares build numbers based on the convention of XXAY(YYY)b, where
-# - XX is the Darwin number
-# - A is the build letter, where A typically relates to XX.0, B to XX.1, etc.
-# - Y(YYY) is a minor build number which can be anything from 1 to a four-
-#   digit number. Typically any 4-digit number refers to a beta, or a forked
-#   build which sometimes occurs when new Mac models are relased.
-# - b is a lower-case letter reserved for beta builds.
-#
-# Darwin numbers are as follows:
-# - macOS 10.14 - Darwin no. 18
-# - macOS 10.15 - Darwin no. 19
-# - macOS 11    - Darwin no. 20
-# - macOS 12    - Darwin no. 21
-# - macOS 13    - Darwin no. 22
-# 
-# This function determines if the OS, minor version or patch versions match.
-# -----------------------------------------------------------------------------
-compare_build_versions() {
-    first_build="$1"
-    second_build="$2"
-
-    first_build_darwin=${first_build:0:2}
-    second_build_darwin=${second_build:0:2}
-    first_build_letter=${first_build:2:1}
-    second_build_letter=${second_build:2:1}
-    first_build_minor=${first_build:3}
-    second_build_minor=${second_build:3}
-    first_build_minor_no=${first_build_minor//[!0-9]/}
-    second_build_minor_no=${second_build_minor//[!0-9]/}
-    first_build_minor_beta=${first_build_minor//[0-9]/}
-    second_build_minor_beta=${second_build_minor//[0-9]/}
-
-    builds_match="no"
-    versions_match="no"
-    os_matches="no"
-
-    writelog "[compare_build_versions] Comparing (1) $first_build with (2) $second_build"
-    if [[ "$first_build" == "$second_build" ]]; then
-        writelog "[compare_build_versions] $first_build = $second_build"
-        builds_match="yes"
-        versions_match="yes"
-        os_matches="yes"
-        return
-    elif [[ $first_build_darwin -gt $second_build_darwin ]]; then
-        writelog "[compare_build_versions] $first_build > $second_build"
-        first_build_newer="yes"
-        first_build_major_newer="yes"
-        return
-    elif [[ $first_build_letter > $second_build_letter && $first_build_darwin -eq $second_build_darwin ]]; then
-        writelog "[compare_build_versions] $first_build > $second_build"
-        first_build_newer="yes"
-        first_build_minor_newer="yes"
-        os_matches="yes"
-        return
-    elif [[ ! $first_build_minor_beta && $second_build_minor_beta && $first_build_letter == "$second_build_letter" && $first_build_darwin -eq $second_build_darwin ]]; then
-        writelog "[compare_build_versions] $first_build > $second_build (production > beta)"
-        first_build_newer="yes"
-        first_build_patch_newer="yes"
-        versions_match="yes"
-        os_matches="yes"
-        return
-    elif [[ ! $first_build_minor_beta && ! $second_build_minor_beta && $first_build_minor_no -lt 1000 && $second_build_minor_no -lt 1000 && $first_build_minor_no -gt $second_build_minor_no && $first_build_letter == "$second_build_letter" && $first_build_darwin -eq $second_build_darwin ]]; then
-        writelog "[compare_build_versions] $first_build > $second_build"
-        first_build_newer="yes"
-        first_build_patch_newer="yes"
-        versions_match="yes"
-        os_matches="yes"
-        return
-    elif [[ ! $first_build_minor_beta && ! $second_build_minor_beta && $first_build_minor_no -ge 1000 && $second_build_minor_no -ge 1000 && $first_build_minor_no -gt $second_build_minor_no && $first_build_letter == "$second_build_letter" && $first_build_darwin -eq $second_build_darwin ]]; then
-        writelog "[compare_build_versions] $first_build > $second_build (both betas)"
-        first_build_newer="yes"
-        first_build_patch_newer="yes"
-        versions_match="yes"
-        os_matches="yes"
-        return
-    elif [[ $first_build_minor_beta && $second_build_minor_beta && $first_build_minor_no -ge 1000 && $second_build_minor_no -ge 1000 && $first_build_minor_no -gt $second_build_minor_no && $first_build_letter == "$second_build_letter" && $first_build_darwin -eq $second_build_darwin ]]; then
-        writelog "[compare_build_versions] $first_build > $second_build (both betas)"
-        first_build_patch_newer="yes"
-        first_build_newer="yes"
-        versions_match="yes"
-        os_matches="yes"
-        return
-    fi
-
 }
 
 # -----------------------------------------------------------------------------
@@ -755,7 +693,7 @@ confirm() {
         "--icon"
         "${dialog_confirmation_icon}"
         "--iconsize"
-        "128"
+        "${dialog_icon_size}"
         "--overlayicon"
         "SF=person.fill.checkmark,colour=red"
         "--message"
@@ -798,6 +736,26 @@ convert_os_to_name () {
             ;;
     esac
     echo "$os_name"
+}
+
+# -----------------------------------------------------------------------------
+# convert OS major version to name
+# -----------------------------------------------------------------------------
+convert_name_to_os () {
+    local os_major_version
+    case "$1" in
+        "Big Sur") os_major_version="11"
+            ;;
+        "Monterey") os_major_version="12"
+            ;;
+        "Ventura") os_major_version="13"
+            ;;
+        "Sonoma") os_major_version="14"
+            ;;
+        *) os_major_version="$1"
+            ;;
+    esac
+    echo "$os_major_version"
 }
 
 # -----------------------------------------------------------------------------
@@ -999,9 +957,8 @@ dialog_progress() {
 
 # -----------------------------------------------------------------------------
 # Search for an existing downloaded installer.
-# This checks first for a DMG or sparseimage in the working directory, then
-# for an Install macOS X.app in the /Applications folder, and then for an 
-# InstallAssistant.pkg in the working directory.
+# This checks first for an Install macOS X.app in the /Applications folder, 
+# and then for an InstallAssistant.pkg in the working directory.
 # Note that multiple installers left around on the device can cause unexpected
 # results.  
 # -----------------------------------------------------------------------------
@@ -1010,8 +967,6 @@ find_existing_installer() {
     cached_installer_app=$( find "$installer_directory" -maxdepth 1 -name "Install macOS*.app" -type d -print -quit 2>/dev/null )
     cached_installer_app_in_workdir=$( find "$workdir" -maxdepth 1 -name "Install macOS*.app" -type d -print -quit 2>/dev/null )
     cached_installer_pkg=$( find "$workdir" -maxdepth 1 -name "InstallAssistant*.pkg" -type f -print -quit 2>/dev/null )
-    cached_dmg=$( find "$workdir" -maxdepth 1 -name "*.dmg" -type f -print -quit 2>/dev/null )
-    cached_sparseimage=$( find "$workdir" -maxdepth 1 -name "*.sparseimage" -type f -print -quit 2>/dev/null )
 
     if [[ -d "$cached_installer_app" ]]; then
         writelog "[find_existing_installer] Installer found at $cached_installer_app."
@@ -1019,21 +974,11 @@ find_existing_installer() {
         check_installer_is_valid
     elif [[ -d "$cached_installer_app_in_workdir" ]]; then
         cached_installer_app="$cached_installer_app_in_workdir"
-        writelog "[find_existing_installer] Installer found at $cached_installer_app."
+        writelog "[find_existing_installer] Installer found at $cached_installer_app_in_workdir."
         check_installer_is_valid
     elif [[ -f "$cached_installer_pkg" ]]; then
         writelog "[find_existing_installer] InstallAssistant package found at $cached_installer_pkg."
         check_installer_pkg_is_valid
-    elif [[ -f "$cached_dmg" ]]; then
-        writelog "[find_existing_installer] Installer image found at $cached_dmg."
-        hdiutil attach -quiet -noverify -nobrowse "$cached_dmg"
-        cached_installer_app=$( find '/Volumes/'*macOS*/*.app -maxdepth 1 -type d -print -quit 2>/dev/null )
-        check_installer_is_valid
-    elif [[ -f "$cached_sparseimage" ]]; then
-        writelog "[find_existing_installer] Installer sparse image found at $cached_sparseimage."
-        hdiutil attach -quiet -noverify -nobrowse "$cached_sparseimage"
-        cached_installer_app=$( find '/Volumes/'*macOS*/Applications/*.app -maxdepth 1 -type d -print -quit 2>/dev/null )
-        check_installer_is_valid
     else
         writelog "[find_existing_installer] No valid installer found."
         if [[ $clear_cache == "yes" ]]; then
@@ -1195,6 +1140,15 @@ get_default_dialog_args() {
 }
 
 # -----------------------------------------------------------------------------
+# Get the system's device ID (Apple Silicon) or board ID (Intel)
+# -----------------------------------------------------------------------------
+get_device_id() {
+    device_info=$(/usr/sbin/ioreg -c IOPlatformExpertDevice -d 2)
+    board_id=$(grep board-id <<< "$device_info" | awk -F '<"|">' '{ print $2 }')
+    device_id=$(grep target-sub-type <<< "$device_info" | awk -F '<"|">' '{ print $2 }')
+}
+
+# -----------------------------------------------------------------------------
 # Run mist list to get some required output for automation
 # This requires mist, so we first check if it is on the system and download them if not.
 # -----------------------------------------------------------------------------
@@ -1226,16 +1180,9 @@ get_mist_list() {
         writelog "[get_mist_list] Non-default catalog selected (darwin version $darwin_version)"
         mist_args+=("--catalog-url")
         mist_args+=("${catalogs[$darwin_version]}")
-    elif [[ $beta != "yes" ]]; then
-        # we have to restrict the mist-cli search to the production catalog to avoid getting RCs
-        darwin_version=$(get_darwin_from_os_version "$system_version_major")
-        get_catalog
-        writelog "[get_mist_list] Non-default catalog selected (darwin version $darwin_version)"
-        mist_args+=("--catalog-url")
-        mist_args+=("${catalogs[$darwin_version]}")
     fi
 
-    # include betas if selected (which can use all the seed catalogs, which is the mist-cli default)
+    # include betas if selected
     if [[ $beta == "yes" ]]; then
         writelog "[get_mist_list] Beta versions included"
         mist_args+=("--include-betas")
@@ -1416,7 +1363,7 @@ kill_process() {
     process="$1"
     echo
     if process_pid=$(/usr/bin/pgrep -a "$process" 2>/dev/null) ; then
-        writelog "[$script_name] attempting to terminate the '$process' process - Termination message indicates success"
+        writelog "[$script_name] terminating the process '$process' process"
         kill "$process_pid" 2> /dev/null
         if /usr/bin/pgrep -a "$process" >/dev/null ; then
             writelog "[$script_name] ERROR: '$process' could not be killed"
@@ -1516,8 +1463,7 @@ EOT
 )
 
 # -----------------------------------------------------------------------------
-# Copy the installer to the /Applications folder if not already there, and 
-# delete the dmg or sparseimage that encloses it.
+# Move the installer to the /Applications folder if not already there.
 # This is called with the --move option.
 # -----------------------------------------------------------------------------
 move_to_applications_folder() {
@@ -1525,17 +1471,7 @@ move_to_applications_folder() {
         writelog "[move_to_applications_folder] Valid installer already in $installer_directory folder"
     else
         writelog "[move_to_applications_folder] Moving $working_macos_app to $installer_directory folder"
-        # we are actually copying it, not moving it, because we are in a mounted image
-        cp -R "$working_macos_app" "$installer_directory/"
-        cached_installer=$( find /Volumes/*macOS* -maxdepth 2 -type d -name "Install*.app" -print -quit 2>/dev/null )
-        # unmount the image
-        if [[ -d "$cached_installer" ]]; then
-            writelog "[move_to_applications_folder] Mounted installer will be unmounted: $cached_installer"
-            existing_installer_mount_point=$(echo "$cached_installer" | cut -d/ -f 1-3)
-            diskutil unmount force "$existing_installer_mount_point"
-        fi
-        # remove the dmg or sparseimage
-        rm -f "$cached_dmg" "$cached_sparseimage"
+        mv "$working_macos_app" "$installer_directory/"
         working_macos_app=$( find "$installer_directory/Install macOS"*.app -maxdepth 1 -type d -print -quit 2>/dev/null )
         writelog "[move_to_applications_folder] Installer moved to $installer_directory folder"
     fi
@@ -1591,14 +1527,8 @@ overwrite_existing_installer() {
         rm -f "$working_installer_pkg"
     else
         writelog "[overwrite_existing_installer] Overwrite option selected. Deleting existing version."
-        cached_installer=$( find /Volumes/*macOS* -maxdepth 2 -type d -name "Install*.app" -print -quit 2>/dev/null )
-        if [[ -d "$cached_installer" ]]; then
-            writelog "[$script_name] Mounted installer will be unmounted: $cached_installer"
-            existing_installer_mount_point=$(echo "$cached_installer" | cut -d/ -f 1-3)
-            diskutil unmount force "$existing_installer_mount_point"
-        fi
     fi
-    rm -f "$cached_dmg" "$cached_sparseimage" "$cached_installer_pkg" 
+    rm -f "$cached_installer_pkg" 
     rm -rf "$cached_installer_app"
     app_is_in_applications_folder=""
     if [[ $clear_cache == "yes" ]]; then
@@ -1620,7 +1550,7 @@ post_prep_work() {
         writelog "[post_prep_work] Opening full screen dialog (language=$user_language)"
 
         window_type="utility"
-        iconsize=100
+        iconsize=$dialog_icon_size
 
         # set the dialog command arguments
         get_default_dialog_args "$window_type"
@@ -1679,6 +1609,13 @@ run_fetch_full_installer() {
             # check that this version is available in the list
             ffi_available=$(grep -c -E "Version: $prechosen_version," "$workdir/ffi-list-full-installers.txt")
             if [[ $ffi_available -ge 1 ]]; then
+                # check that the latest version is compatible with this system
+                if ! is-at-least "$system_version" "$prechosen_version"; then 
+                    writelog "[run_fetch_full_installer] ERROR: version in catalog $prechosen_version is older than the system version $system_version"
+                    echo
+                    exit 1
+                fi
+
                 # get the chosen version
                 writelog "[run_fetch_full_installer] Found version $prechosen_version"
                 softwareupdate_args+=("--full-installer-version")
@@ -1696,29 +1633,32 @@ run_fetch_full_installer() {
                 else
                     latest_ffi=$(grep -E "Version: $prechosen_os." "$workdir/ffi-list-full-installers.txt" | grep -v beta | head -n1 | cut -d, -f2 | sed 's|.*Version: ||')
                 fi
-                
+
+                # check that the latest version is compatible with this system
+                if ! is-at-least "$system_version" "$latest_ffi"; then 
+                    writelog "[run_fetch_full_installer] ERROR: latest version in catalog $latest_ffi is older than the system version $system_version"
+                    echo
+                    exit 1
+                fi
+
                 writelog "[run_fetch_full_installer] Found version $latest_ffi"
                 softwareupdate_args+=("--full-installer-version")
                 softwareupdate_args+=("$latest_ffi")
             else
-                writelog "[run_fetch_full_installer] WARNING: No available version for macOS $prechosen_os found. Defaulting to latest available version."
+                writelog "[run_fetch_full_installer] ERROR: No available version for macOS $prechosen_os found."
+                echo
+                exit 1
             fi
         else
             # if no version is selected, we want to obtain the latest. The list obtained from
             # --list-full-installers appears to always be in order of newest to oldest, so we can grab the first one
-            if [[ "$beta" == "yes" ]]; then
-                latest_ffi=$(grep -E "Version:" "$workdir/ffi-list-full-installers.txt" | head -n1 | cut -d, -f2 | sed 's|.*Version: ||')
-            else
-                latest_ffi=$(grep -E "Version:" "$workdir/ffi-list-full-installers.txt" | grep -v beta | head -n1 | cut -d, -f2 | sed 's|.*Version: ||')
-            fi
+            latest_ffi=$(grep -E "Version:" "$workdir/ffi-list-full-installers.txt" | head -n1 | cut -d, -f2 | sed 's|.*Version: ||')
 
             if [[ $latest_ffi ]]; then
                 # we need to check if this version is older than the current system and abort if so
-                latest_ffi_major=$(cut -d. -f1 <<< "$latest_ffi")
-                latest_ffi_minor=$(cut -d. -f2 <<< "$latest_ffi")
-                latest_ffi_patch=$(cut -d. -f3 <<< "$latest_ffi")
-                if [[ $latest_ffi_major -lt $system_version_major || ("$latest_ffi_major" == "$system_version_major" && $(echo "$latest_ffi_minor < $system_version_minor" | bc) == 1) || ("$latest_ffi_major" == "$system_version_major" && "$latest_ffi_minor" == "$system_version_minor" && $(echo "$latest_ffi_patch < $system_version_patch" | bc) == 1) ]]; then
-                    writelog "[run_fetch_full_installer] ERROR: latest version in catalog $latest_ffi is older OS than the system version $system_version"
+                writelog "is-at-least \"$latest_ffi\" \"$system_version\"" # TEMP
+                if ! is-at-least "$system_version" "$latest_ffi"; then 
+                    writelog "[run_fetch_full_installer] ERROR: latest version in catalog $latest_ffi is older than the system version $system_version"
                     echo
                     exit 1
                 fi
@@ -1761,38 +1701,23 @@ run_fetch_full_installer() {
 
 # -----------------------------------------------------------------------------
 # Run softwareupdate --list-full-installers and output to a file
-# Includes some fallbacks, because this function might not be available in some 
-# versions of Catalina
 # -----------------------------------------------------------------------------
 run_list_full_installers() {
-    if [[ $system_version_major -lt 13 || ($system_version_major -eq 13 && $system_version_minor -lt 4) ]]; then
-        # include betas if selected
-        if [[ $beta == "yes" ]]; then
-            writelog "[run_list_full_installers] Beta versions included"
-            if [[ ! $seedprogram ]]; then
-                seedprogram="PublicSeed"
+    if [[ $beta == "yes" ]]; then
+        if /usr/sbin/softwareupdate --list-full-installers | grep -v "Deferred: YES" > "$workdir/ffi-list-full-installers.txt"; then
+            if [[ $(grep -c -E "Version:" "$workdir/ffi-list-full-installers.txt") -lt 1 ]]; then
+                writelog "[run_list_full_installers] Could not obtain installer information using softwareupdate."
+                exit 1
             fi
         fi
-        set_seedprogram
-        echo
-        # try up to 3 times to workaround bug when changing seed programs
-        try=3
-        while [[ $try -gt 0 ]]; do
-            if /usr/sbin/softwareupdate --list-full-installers | grep -v "Deferred: YES" > "$workdir/ffi-list-full-installers.txt"; then
-                if [[ $(grep -c -E "Version:" "$workdir/ffi-list-full-installers.txt") -ge 1 ]]; then
-                    break
-                fi
+    else
+        if /usr/sbin/softwareupdate --list-full-installers | grep -v "Deferred: YES" | grep -v "Beta," > "$workdir/ffi-list-full-installers.txt"; then
+            if [[ $(grep -c -E "Version:" "$workdir/ffi-list-full-installers.txt") -lt 1 ]]; then
+                writelog "[run_list_full_installers] Could not obtain installer information using softwareupdate."
+                exit 1
             fi
-            ((try--))
-        done
-        if [[ $try -eq 0 ]]; then
-            writelog "[run_list_full_installers] Could not obtain installer information using softwareupdate."
-            exit 1
         fi
-    elif [[ $beta == "yes" ]]; then
-        echo "Seed program cannot be set on macOS 13.4 or greater."
     fi
-
 }
 
 # -----------------------------------------------------------------------------
@@ -1814,10 +1739,14 @@ run_mist() {
     # restrict to a particular major OS if selected
     if [[ $prechosen_os ]]; then
         # check whether chosen OS is older than the system
-        if [[ $prechosen_os < $system_version_major ]]; then
-            writelog "[run_mist] ERROR: cannot select an older OS than the system"
+        prechosen_os=$(convert_name_to_os "$prechosen_os")
+
+        if ! is-at-least "${system_version/\.*/}" "$prechosen_os"; then
+            writelog "[run_mist] ERROR: cannot select an older OS ($prechosen_os) than the system (${system_version/\.*/}), cannot continue."
             echo
             exit 1
+        else
+            writelog "[run_mist] Selected OS ($prechosen_os) is the same as or newer than the system (${system_version/\.*/}), proceeding..."
         fi
         # to avoid a bug where mist-cli does a glob search for the major version, convert it to the name (this is resolved in mist-cli 2.0 but will leave here for now to avoid problems with older installations)
         prechosen_os_name=$(convert_os_to_name "$prechosen_os")
@@ -1826,21 +1755,12 @@ run_mist() {
 
     # restrict to a particular version if selected
     elif [[ $prechosen_version ]]; then
-        prechosen_version_check=$(cut -d. -f1 <<< "$prechosen_version")
-        if [[ $prechosen_version_check -eq 10 ]]; then
-            prechosen_version_major=$(cut -d. -f1,2 <<< "$prechosen_version")
-            prechosen_version_minor=$(cut -d. -f3 <<< "$prechosen_version")
-            prechosen_version_patch=0
-        else
-            prechosen_version_major=$(cut -d. -f1 <<< "$prechosen_version")
-            prechosen_version_minor=$(cut -d. -f2 <<< "$prechosen_version")
-            prechosen_version_patch=$(cut -d. -f3 <<< "$prechosen_version")
-        fi
-        # check for an older version
-        if [[ $(echo "$prechosen_version_major < $system_version_major " | bc) == 1 || ("$prechosen_version_major" == "$system_version_major" && $(echo "$prechosen_version_minor < $system_version_minor" | bc) == 1) || ("$prechosen_version_major" == "$system_version_major" && "$prechosen_version_minor" == "$system_version_minor" && $(echo "$prechosen_version_patch < $system_version_patch" | bc) == 1) ]]; then
-            writelog "[run_mist] ERROR: cannot select an older version than the system"
+        if ! is-at-least "$system_version" "$prechosen_version"; then 
+            writelog "[run_mist] ERROR: cannot select an older version ($prechosen_version) than the system($system_version)"
             echo
             exit 1
+        else
+            writelog "[run_mist] Selected version ($prechosen_version) is the same as or newer than the system ($system_version), proceeding..."
         fi
         writelog "[run_mist] Checking that selected version $prechosen_version is available"
         mist_args+=("$prechosen_version")
@@ -1872,27 +1792,12 @@ run_mist() {
         writelog "[run_mist] Checking that current version $system_version is available"
         mist_args+=("$system_version")
 
-    # restrict to the same major OS as the system if selected
-    elif [[ $sameos == "yes" ]]; then
-        writelog "[run_mist] Checking that current OS $system_version_major is available"
-        mist_args+=("$system_version_major")
-
     else
         # if no version was selected, we want the latest available, which is the first in the mist-list
         latest_version=$(ljt '0.version' < "$mist_export_file")
-        latest_version_check=$(cut -d. -f1 <<< "$latest_version")
-        if [[ $latest_version_check -eq 10 ]]; then
-            latest_version_major=$(cut -d. -f1,2 <<< "$latest_version")
-            latest_version_minor=$(cut -d. -f3 <<< "$latest_version")
-            latest_version_patch=0
-        else
-            latest_version_major=$(cut -d. -f1 <<< "$latest_version")
-            latest_version_minor=$(cut -d. -f2 <<< "$latest_version")
-            latest_version_patch=$(cut -d. -f3 <<< "$latest_version")
-        fi
         if [[ $latest_version ]]; then
-            if [[ $(echo "$latest_version_major < $system_version_major" | bc) == 1 || ("$latest_version_major" == "$system_version_major" && $(echo "$latest_version_minor < $system_version_minor" | bc) == 1) || ("$latest_version_major" == "$system_version_major" && "$latest_version_minor" == "$system_version_minor" && $(echo "$latest_version_patch < $system_version_patch" | bc) == 1) ]]; then
-                writelog "[run_mist] ERROR: latest version in catalog ($latest_version) is older OS than the system version ($system_version)"
+            if ! is-at-least "$system_version" "$latest_version"; then
+                writelog "[run_mist] ERROR: latest version in catalog ($latest_version) is older than the system version ($system_version)"
                 echo
                 exit 1
             fi
@@ -1963,13 +1868,6 @@ run_mist() {
         writelog "[run_mist] Non-default catalog selected (darwin version $darwin_version)"
         mist_args+=("--catalog-url")
         mist_args+=("${catalogs[$darwin_version]}")
-    elif [[ $beta != "yes" ]]; then
-        # we have to restrict the mist-cli search to the production catalog to avoid getting RCs
-        darwin_version=$(get_darwin_from_os_version "$system_version_major")
-        get_catalog
-        writelog "[get_mist_list] Non-default catalog selected (darwin version $darwin_version)"
-        mist_args+=("--catalog-url")
-        mist_args+=("${catalogs[$darwin_version]}")
     fi
 
     # include betas if selected
@@ -1978,6 +1876,7 @@ run_mist() {
         mist_args+=("--include-betas")
     fi
 
+    # now run mist
     echo
     writelog "[run_mist] This command is now being run:"
     echo
@@ -1993,10 +1892,6 @@ run_mist() {
     downloaded_app=$( find "$installer_directory" -maxdepth 1 -name "Install macOS *.app" -type d -print -quit )
     downloaded_installer_pkg=$( find "$workdir" -maxdepth 1 -name "InstallAssistant-*-*.pkg" -type f -print -quit 2>/dev/null )
 
-    # Identify the installer dmg
-    cached_dmg=$( find "$workdir" -maxdepth 1 -name 'Install_macOS*.dmg' -type f -print -quit )
-    cached_sparseimage=$( find "$workdir" -maxdepth 1 -name 'Install_macOS*.sparseimage' -type f -print -quit )
-
     if [[ -d "$downloaded_app" ]]; then
         downloaded_app_name=$(basename "$downloaded_app")
         writelog "[run_mist] $downloaded_app_name downloaded to $installer_directory."
@@ -2005,22 +1900,6 @@ run_mist() {
         downloaded_installer_pkg_name=$(basename "$downloaded_installer_pkg")
         writelog "[run_mist] $downloaded_installer_pkg_name downloaded to $workdir."
         working_installer_pkg="$downloaded_installer_pkg"
-    elif [[ -f "$cached_dmg" ]]; then
-        writelog "[run_mist] Mounting disk image to identify installer app."
-        if hdiutil attach -quiet -noverify -nobrowse "$cached_dmg" ; then
-            working_macos_app=$( find '/Volumes/'*macOS*/*.app -maxdepth 1 -type d -print -quit 2>/dev/null )
-        else
-            writelog "[run_mist] ERROR: could not mount $cached_dmg"
-            exit 1
-        fi
-    elif [[ -f "$cached_sparseimage" ]]; then
-        writelog "[run_mist] Mounting sparse disk image to identify installer app."
-        if hdiutil attach -quiet -noverify -nobrowse "$cached_sparseimage" ; then
-            working_macos_app=$( find '/Volumes/'*macOS*/Applications/*.app -maxdepth 1 -type d -print -quit 2>/dev/null )
-        else
-            writelog "[run_mist] ERROR: could not mount $cached_sparseimage"
-            exit 1
-        fi
     else
         writelog "[run_mist] No installer found. I guess nothing got downloaded."
         exit 1
@@ -2294,42 +2173,6 @@ set_localisations() {
 }
 
 # -----------------------------------------------------------------------------
-# Set the Seed Program using seedutil - this is required when using 
-# softwareupdate --fetch-full-installer
-# -----------------------------------------------------------------------------
-set_seedprogram() {
-    current_seed=$(/System/Library/PrivateFrameworks/Seeding.framework/Versions/A/Resources/seedutil current | grep "Currently enrolled in:" | sed 's|Currently enrolled in: ||')
-    if [[ $seedprogram ]]; then
-        writelog "[set_seedprogram] $seedprogram seed program selected"
-        if [[ "$current_seed" == "$seedprogram" ]]; then
-            writelog "[set_seedprogram] already enrolled in $seedprogram"
-        else
-            seedutilresult=$(/System/Library/PrivateFrameworks/Seeding.framework/Versions/A/Resources/seedutil enroll "$seedprogram")
-            if [[ "$seedutilresult" == *"*NOT*"* ]]; then
-                writelog "[set_seedprogram] ERROR: Unable to change to the $seedprogram seed program. You might get unexpected results."
-                echo "progresstext: ERROR: Unable to change to the $seedprogram seed program." >> "$dialog_log"
-                sleep 5
-            fi
-        fi
-    else
-        writelog "[set_seedprogram] Standard seed program selected"
-        if [[ "$current_seed" == "(null)" ]]; then
-            writelog "[set_seedprogram] already unenrolled"
-        else
-            seedutilresult=$(/System/Library/PrivateFrameworks/Seeding.framework/Versions/A/Resources/seedutil unenroll)
-            if [[ ! "$seedutilresult" == *"Program: (null)"* ]]; then
-                writelog "[set_seedprogram] ERROR: Unable to unenroll seed program. You might get unexpected results."
-                echo "progresstext: ERROR: Unable to unenroll seed program.." >> "$dialog_log"
-                sleep 5
-           fi
-        fi
-    fi
-    sleep 5
-    current_seed=$(/System/Library/PrivateFrameworks/Seeding.framework/Versions/A/Resources/seedutil current | grep "Currently enrolled in:" | sed 's|Currently enrolled in: ||')
-    writelog "[set_seedprogram] Currently enrolled in $current_seed seed program."
-}
-
-# -----------------------------------------------------------------------------
 # Usage message
 # -----------------------------------------------------------------------------
 show_help() {
@@ -2390,6 +2233,10 @@ show_help() {
     --overwrite         Delete any existing macOS installer found in $installer_directory and download
                         the current installer within the limits set by --os or --version.
 
+    Options for dialogs:
+
+    --confirmation-icon Set a custom confirmation icon
+    --icon-size         Set the icon size in dialogs
 
     Advanced options:
 
@@ -2407,9 +2254,8 @@ show_help() {
                         completes preparation, but before reboot.
                         An example might be 'jamf recon -department Spare'.
                         Ensure that the command is in quotes.
-    --catalog ...       Override the default catalog with one from a different OS 
-                        (overrides --seed/--seedprogram).
-    --catalogurl ...    Select a non-standard catalog URL (overrides --seed/--seedprogram).
+    --catalog ...       Override the default catalog with one from a different OS.
+    --catalogurl ...    Select a non-standard catalog URL.
     --caching-server ...
                         Set mist-cli to use a Caching Server, specifying the URL to the server.
     --pkg               Creates a package from the installer. Ignored if --move, --erase or --reinstall is selected.
@@ -2469,6 +2315,8 @@ show_help() {
     --kc-service        The name of the key containing the account and password
     --silent            Silent mode. No dialogs. Requires use of keychain (--kc mode) for Apple Silicon 
                         to provide a password, or the --credentials/--very-insecure-mode mode.
+    --check-activity    If certain activity is detected, the script exits. Currently only supports 
+                        Zoom meetings and Slack huddles.
     --quiet             Remove output from mist during installer download. Note that no progress 
                         is shown.
     --preservecontainer Preserves other volumes in your APFS container when using --erase
@@ -2537,7 +2385,7 @@ user_is_invalid() {
             "--icon"
             "${dialog_warning_icon}"
             "--iconsize"
-            "128"
+            "${dialog_icon_size}"
             "--overlayicon"
             "SF=person.fill.xmark,colour=red"
             "--message"
@@ -2565,7 +2413,7 @@ password_is_invalid() {
             "--icon"
             "${dialog_confirmation_icon}"
             "--iconsize"
-            "128"
+            "${dialog_icon_size}"
             "--overlayicon"
             "SF=person.fill.xmark,colour=red"
             "--message"
@@ -2594,7 +2442,7 @@ user_not_volume_owner() {
             "--icon"
             "${dialog_warning_icon}"
             "--iconsize"
-            "128"
+            "${dialog_icon_size}"
             "--overlayicon"
             "SF=person.fill.xmark,colour=red"
             "--message"
@@ -2616,6 +2464,9 @@ writelog() {
 # =============================================================================
 # Main Body 
 # =============================================================================
+
+# autoload is-at-least module for version comparisons
+autoload is-at-least
 
 # ensure the finish function is executed when exit is signaled
 trap "finish" EXIT
@@ -2668,6 +2519,8 @@ while test $# -gt 0 ; do
         -u|--update) update_installer="yes"
             ;;
         -c|--confirm) confirm="yes"
+            ;;
+        --check-activity) check_for_activity="yes"
             ;;
         --beta) beta="yes"
             ;;
@@ -2748,10 +2601,6 @@ while test $# -gt 0 ; do
             shift
             min_drive_space="$1"
             ;;
-        --seed|--seedprogram)
-            shift
-            seedprogram="$1"
-            ;;
         --catalogurl)
             shift
             catalogurl="$1"
@@ -2802,6 +2651,15 @@ while test $# -gt 0 ; do
             shift
             credentials="$1"
             ;;
+        --confirmation-icon)
+            shift
+            custom_icon="yes"
+            dialog_confirmation_icon="$1"
+            ;;
+        --icon-size)
+            shift
+            dialog_icon_size="$1"
+            ;;
         --kc)
             shift
             kc="$1"
@@ -2815,72 +2673,72 @@ while test $# -gt 0 ; do
             kc_service="$1"
             ;;
         --kc=*)
-            kc=$(echo "$1" | sed -e 's|^[^=]*=||g')
+            kc=$(echo "$1" | sed -e 's|^[^=]*=||g' | tr -d '"')
             ;;
         --kc-pass*)
-            kc_pass=$(echo "$1" | sed -e 's|^[^=]*=||g')
+            kc_pass=$(echo "$1" | sed -e 's|^[^=]*=||g' | tr -d '"')
             ;;
         --kc-service*)
-            kc_service=$(echo "$1" | sed -e 's|^[^=]*=||g')
+            kc_service=$(echo "$1" | sed -e 's|^[^=]*=||g' | tr -d '"')
             ;;
         --power-wait-limit*)
-            power_wait_timer=$(echo "$1" | sed -e 's|^[^=]*=||g')
+            power_wait_timer=$(echo "$1" | sed -e 's|^[^=]*=||g' | tr -d '"')
             ;;
         --min-drive-space*)
-            min_drive_space=$(echo "$1" | sed -e 's|^[^=]*=||g')
-            ;;
-        --seedprogram*)
-            seedprogram=$(echo "$1" | sed -e 's|^[^=]*=||g')
+            min_drive_space=$(echo "$1" | sed -e 's|^[^=]*=||g' | tr -d '"')
             ;;
         --catalogurl*)
-            catalogurl=$(echo "$1" | sed -e 's|^[^=]*=||g')
+            catalogurl=$(echo "$1" | sed -e 's|^[^=]*=||g' | tr -d '"')
             ;;
         --catalog*)
-            catalog=$(echo "$1" | sed -e 's|^[^=]*=||g')
+            catalog=$(echo "$1" | sed -e 's|^[^=]*=||g' | tr -d '"')
             ;;
         --caching-server*)
-            caching_server=$(echo "$1" | sed -e 's|^[^=]*=||g')
+            caching_server=$(echo "$1" | sed -e 's|^[^=]*=||g' | tr -d '"')
             ;;
         --path*)
-            installer_directory=$(echo "$1" | sed -e 's|^[^=]*=||g')
+            installer_directory=$(echo "$1" | sed -e 's|^[^=]*=||g' | tr -d '"')
             ;;
         --extras*)
-            extras_directory=$(echo "$1" | sed -e 's|^[^=]*=||g')
+            extras_directory=$(echo "$1" | sed -e 's|^[^=]*=||g' | tr -d '"')
             ;;
         --os*)
-            prechosen_os=$(echo "$1" | sed -e 's|^[^=]*=||g')
+            prechosen_os=$(echo "$1" | sed -e 's|^[^=]*=||g' | tr -d '"')
             ;;
         --user*)
-            account_shortname=$(echo "$1" | sed -e 's|^[^=]*=||g')
+            account_shortname=$(echo "$1" | sed -e 's|^[^=]*=||g' | tr -d '"')
             ;;
         --max-password-attempts*)
-            new_max_password_attempts=$(echo "$1" | sed -e 's|^[^=]*=||g')
+            new_max_password_attempts=$(echo "$1" | sed -e 's|^[^=]*=||g' | tr -d '"')
             if [[ ( $new_max_password_attempts == "infinite" ) || ( $new_max_password_attempts -gt 0 ) ]]; then
                 max_password_attempts="$new_max_password_attempts"
             fi
             ;;
         --rebootdelay*)
-            rebootdelay=$(echo "$1" | sed -e 's|^[^=]*=||g')
+            rebootdelay=$(echo "$1" | sed -e 's|^[^=]*=||g' | tr -d '"')
             if [[ $rebootdelay -gt 300 ]]; then
                 rebootdelay=300
             fi
             ;;
         --version*)
-            prechosen_version=$(echo "$1" | sed -e 's|^[^=]*=||g')
+            prechosen_version=$(echo "$1" | sed -e 's|^[^=]*=||g' | tr -d '"')
             ;;
         --build*)
-            prechosen_build=$(echo "$1" | sed -e 's|^[^=]*=||g')
+            prechosen_build=$(echo "$1" | sed -e 's|^[^=]*=||g' | tr -d '"')
             ;;
         --workdir*)
-            workdir=$(echo "$1" | sed -e 's|^[^=]*=||g')
+            workdir=$(echo "$1" | sed -e 's|^[^=]*=||g' | tr -d '"')
             ;;
         --preinstall-command*)
-            command=$(echo "$1" | sed -e 's|^[^=]*=||g')
+            command=$(echo "$1" | sed -e 's|^[^=]*=||g' | tr -d '"')
             preinstall_command+=("$command")
             ;;
         --postinstall-command*)
-            command=$(echo "$1" | sed -e 's|^[^=]*=||g')
+            command=$(echo "$1" | sed -e 's|^[^=]*=||g' | tr -d '"')
             postinstall_command+=("$command")
+            ;;
+        --credentials*)
+            credentials=$(echo "$1" | sed -e 's|^[^=]*=||g' | tr -d '"')
             ;;
         -h|--help) show_help
             ;;
@@ -2928,6 +2786,40 @@ if [[ $erase == "yes" || $reinstall == "yes" ]]; then
     fi
 fi
 
+# some options vary based on installer versions
+system_version=$( /usr/bin/sw_vers -productVersion )
+system_build=$( /usr/bin/sw_vers -buildVersion )
+
+writelog "[$script_name] System version: $system_version (Build: $system_build)"
+
+# check if this is the latest version of erase-install
+if [[ "$no_curl" != "yes" ]]; then
+    if is-at-least "13" "$system_version"; then 
+        latest_erase_install_vers=$(/usr/bin/curl https://api.github.com/repos/grahampugh/erase-install/releases/latest 2>/dev/null | plutil -extract name raw -- -)
+        if ! is-at-least "$version" "$latest_erase_install_vers"; then
+            writelog "[$script_name] A newer version of this script is available. Visit https://github.com/grahampugh/erase-install/releases/tag/v$latest_erase_install_vers to obtain the latest version."
+        fi
+    fi
+fi
+
+# bail if system is older than macOS 10.15
+if ! is-at-least "10.15" "$system_version"; then 
+    writelog "[$script_name] This script requires macOS 10.15 or newer. Please use version 27.x of erase-install.sh on older systems."
+    echo
+    exit 1
+fi
+
+if [[ ! $silent ]]; then
+    # bail if system is older than macOS 11 and --silent mode is not selected
+    if ! is-at-least "11" "$system_version"; then 
+        writelog "[$script_name] This script requires macOS 11 or newer in interactive mode. Please use version 27.3 of erase-install.sh on older systems."
+        echo
+        exit 1
+    fi
+    # get dialog app if not silent mode
+    check_for_swiftdialog_app
+fi
+
 # account for when people mistakenly put a version string instead of a major OS
 if [[ "$prechosen_os" ]]; then
     prechosen_os_check=$(cut -d. -f1 <<< "$prechosen_os")
@@ -2938,53 +2830,22 @@ if [[ "$prechosen_os" ]]; then
     fi
 fi
 
-# some options vary based on installer versions
-system_version=$( /usr/bin/sw_vers -productVersion )
-system_build=$( /usr/bin/sw_vers -buildVersion )
-system_os=$(cut -d. -f 1 <<< "$system_version")
-if [[ $system_os -eq 10 ]]; then
-    system_version_major=$(cut -d. -f1,2 <<< "$system_version")
-    system_version_minor=$(cut -d. -f3 <<< "$system_version")
-    system_version_patch=0
-else
-    system_version_major=$(cut -d. -f1 <<< "$system_version")
-    system_version_minor=$(cut -d. -f2 <<< "$system_version")
-    system_version_patch=$(cut -d. -f3 <<< "$system_version")
-fi
-
-writelog "[$script_name] System version: $system_version (Build: $system_build)"
-
-# check if this is the latest version of erase-install
-if [[ "$no_curl" != "yes" && $(echo "$system_version_major >= 13" | bc) == 1 ]]; then
-    latest_erase_install_vers=$(/usr/bin/curl https://api.github.com/repos/grahampugh/erase-install/releases/latest 2>/dev/null | plutil -extract name raw -- -)
-    if [[ $(echo "$latest_erase_install_vers > $version" | bc) -eq 1 ]]; then
-        writelog "[$script_name] A newer version of this script is available. Visit https://github.com/grahampugh/erase-install/releases/tag/v$latest_erase_install_vers to obtain the latest version."
+# set prechosen_os to sameos if selected
+if [[ "$sameos" ]]; then
+    system_os=$(cut -d. -f 1 <<< "$system_version")
+    if [[ $system_os -eq 10 ]]; then
+        system_version_major=$(cut -d. -f1,2 <<< "$system_version")
+    else
+        system_version_major=$(cut -d. -f1 <<< "$system_version")
     fi
-fi
-
-# bail if system is older than macOS 10.15
-if [[ $(echo "$system_version_major < 10.15" | bc) == 1 ]]; then
-    writelog "[$script_name] This script requires macOS 10.15 or newer. Please use version 27.x of erase-install.sh on older systems."
-    echo
-    exit 1
-fi
-
-if [[ ! $silent ]]; then
-    # bail if system is older than macOS 11 and --silent mode is not selected
-    if [[ $(echo "$system_version_major < 11" | bc) == 1 ]]; then
-        writelog "[$script_name] This script requires macOS 11 or newer in interactive mode. Please use version 27.x of erase-install.sh on older systems."
-        echo
-        exit 1
-    fi
-    # get dialog app if not silent mode
-    check_for_swiftdialog_app
+    prechosen_os="$system_version_major"
 fi
 
 # exit out or correct for incompatible options
 if [[ $erase == "yes" && $reinstall == "yes" ]]; then
     writelog "[$script_name] ERROR: Choose either --erase or --reinstall options, but not both!"
     exit 1
-elif [[ ($prechosen_os && $prechosen_version) || ($prechosen_os && $prechosen_build) || ($prechosen_version && $prechosen_build) || ($sameos && $prechosen_version) || ($sameos && $prechosen_os) || ($sameos && $prechosen_build) ]]; then
+elif [[ ($prechosen_os && $prechosen_version) || ($prechosen_os && $prechosen_build) || ($prechosen_version && $prechosen_build) || ($sameos && $prechosen_version) || ($sameos && $prechosen_build) ]]; then
     writelog "[$script_name] ERROR: Choose a maximum of one of the --os, --version, --build, or --sameos options at the same time!"
     exit 1
 elif [[ ($overwrite == "yes" && $update_installer == "yes") || ($replace_invalid_installer == "yes" && $overwrite == "yes") || ($replace_invalid_installer == "yes" && $update_installer == "yes") ]]; then
@@ -2993,7 +2854,7 @@ elif [[ ($overwrite == "yes" && $update_installer == "yes") || ($replace_invalid
 fi
 
 # different dialog icon for OS older than macOS 13
-if [[ $(echo "$system_version_major < 13" | bc) == 1 ]]; then
+if ! is-at-least "13" "$system_version"; then 
     dialog_confirmation_icon="/System/Applications/System Preferences.app"
 fi
 
@@ -3050,12 +2911,16 @@ fi
 if [[ $erase == "yes" || $reinstall == "yes" ]]; then
     # check for drive space if invoking erase or reinstall options
     check_free_space
+
+    # check for user activity - will quit here if a meeting is open
+    if [[ $check_for_activity == "yes" ]]; then
+        check_for_presentation_activity
+    fi
 fi
 
 # Look for the installer
 writelog "[$script_name] Looking for existing installer app or pkg"
 find_existing_installer
-
 
 # Work through various options to decide whether to replace an existing installer
 do_overwrite_existing_installer=0
@@ -3065,16 +2930,10 @@ if [[ $overwrite == "yes" && (-d "$working_macos_app" || ($pkg_installer && -f "
     do_overwrite_existing_installer=1
 fi
 
-if [[ "$prechosen_build" != "" ]]; then
+if [[ "$prechosen_build" ]]; then
     # automatically replace a cached installer if it does not match the requested build
     writelog "[$script_name] Checking if the cached installer matches requested build..."
-    if [[ "$installer_build" ]]; then
-        installer_darwin_version=${installer_build:0:2}
-    elif [[ "$installer_pkg_build" ]]; then
-        installer_darwin_version=${installer_pkg_build:0:2}
-    fi
-    compare_build_versions "$prechosen_build" "$prechosen_build"
-    if [[ "$builds_match" != "yes" ]]; then
+    if [[ "$installer_build" != "$prechosen_build" ]]; then
         writelog "[$script_name] Existing installer build $prechosen_build does not match requested build $prechosen_build."
         do_overwrite_existing_installer=1
     else
@@ -3082,7 +2941,7 @@ if [[ "$prechosen_build" != "" ]]; then
     fi
 fi
 
-if [[ "$prechosen_os" != "" ]]; then
+if [[ "$prechosen_os" ]]; then
     # check if the cached installer matches the requested OS
     # first, get the OS of the existing installer app or pkg
     if [[ "$installer_build" ]]; then
@@ -3091,7 +2950,7 @@ if [[ "$prechosen_os" != "" ]]; then
         installer_darwin_version=${installer_pkg_build:0:2}
     fi
     prechosen_darwin_version=$(get_darwin_from_os_version "$prechosen_os")
-    if [[ $installer_darwin_version -ne $prechosen_darwin_version ]]; then
+    if [[ $installer_darwin_version && ($installer_darwin_version -ne $prechosen_darwin_version) ]]; then
         writelog "[$script_name] Existing installer OS version does not match requested OS ($prechosen_os)."
         do_overwrite_existing_installer=1
     fi
@@ -3151,14 +3010,14 @@ fi
 if [[ ! -d "$working_macos_app" && ! -f "$working_installer_pkg" ]]; then
     if [[ ! $silent ]]; then
         # if erasing or reinstalling, open a dialog to state that the download is taking place.
-        if [[ $erase == "yes" || $reinstall == "yes" || $dl_dialog == "yes" ]]; then
+        if [[ $erase == "yes" || $reinstall == "yes" || ($dl_dialog == "yes" && $check_for_activity != "yes") ]]; then
             # if no_fs is set, show a utility window instead of the full screen display (for test purposes)
             if [[ $fs == "yes" ]]; then
                 window_type="fullscreen"
                 iconsize=200
             else
                 window_type="utility"
-                iconsize=100
+                iconsize=$dialog_icon_size
             fi
             # set the dialog command arguments
             get_default_dialog_args "$window_type"
@@ -3201,7 +3060,7 @@ fi
 
 # Move to $installer_directory if move_to_applications_folder flag is included
 # Not relevant for fetch_full_installer option
-if [[ $move == "yes" && ("$cached_installer_pkg" || "$cached_installer_app" || "$cached_sparseimage" || "$cached_dmg" ) ]]; then
+if [[ $move == "yes" && ("$cached_installer_pkg" || "$cached_installer_app" ) ]]; then
     writelog "[$script_name] Invoking --move option"
     echo "progresstext: Moving installer to Applications folder" >> "$dialog_log"
     if [[ -f "$working_installer_pkg" ]]; then
@@ -3218,15 +3077,6 @@ if [[ $erase != "yes" && $reinstall != "yes" ]]; then
         echo "quit:" >> "$dialog_log" & sleep 0.1
     fi
 
-    # Unmount the dmg
-    if [[ ! $ffi ]]; then
-        cached_installer=$(find /Volumes/*macOS* -maxdepth 2 -type d -name "Install*.app" -print -quit 2>/dev/null )
-        if [[ -d "$cached_installer" ]]; then
-            writelog "[$script_name] Mounted installer will be unmounted: $cached_installer"
-            existing_installer_mount_point=$(echo "$cached_installer" | cut -d/ -f 1-3)
-            diskutil unmount force "$existing_installer_mount_point"
-        fi
-    fi
     # Clear the working directory
     writelog "[$script_name] Cleaning working directory '$workdir/content'"
     rm -rf "$workdir/content"
@@ -3340,9 +3190,11 @@ if ! file -b "$icon_path" | grep "PNG image data" > /dev/null; then
     fi
 fi
 
-# check again whether we have the image now, if not, display a generic image
+# check again whether we have the image now or a confirmation icon set, if not, display a generic image
 if file -b "$icon_path" | grep "PNG image data"; then
     dialog_install_icon="$icon_path"
+elif [[ "$custom_icon" == "yes" ]]; then
+    dialog_install_icon="$dialog_confirmation_icon"
 else
     dialog_install_icon="warning"
 fi
@@ -3353,7 +3205,7 @@ if [[ $fs == "yes" || ($erase == "yes" && $no_fs != "yes") || ($reinstall == "ye
     iconsize=200
 else
     window_type="utility"
-    iconsize=100
+    iconsize=$dialog_icon_size
 fi
 
 # dialogs for erase
